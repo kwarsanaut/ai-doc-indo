@@ -1,0 +1,420 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-doc-processor-api
+  labels:
+    app: ai-doc-processor
+    component: api
+    version: v1.0.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ai-doc-processor
+      component: api
+  template:
+    metadata:
+      labels:
+        app: ai-doc-processor
+        component: api
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: api
+        image: ai-doc-processor:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/0"
+        - name: CELERY_BROKER_URL
+          value: "redis://redis-service:6379/0"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: WORKERS
+          value: "4"
+        envFrom:
+        - secretRef:
+            name: ai-doc-processor-secrets
+        - configMapRef:
+            name: ai-doc-processor-config
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+            ephemeral-storage: "2Gi"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+            ephemeral-storage: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: temp-storage
+          mountPath: /app/temp
+        - name: upload-storage
+          mountPath: /app/uploads
+        - name: logs-storage
+          mountPath: /app/logs
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: temp-storage
+        emptyDir:
+          sizeLimit: "5Gi"
+      - name: upload-storage
+        persistentVolumeClaim:
+          claimName: upload-storage-pvc
+      - name: logs-storage
+        persistentVolumeClaim:
+          claimName: logs-storage-pvc
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      serviceAccountName: ai-doc-processor-sa
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-doc-processor-worker
+  labels:
+    app: ai-doc-processor
+    component: worker
+    version: v1.0.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ai-doc-processor
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: ai-doc-processor
+        component: worker
+        version: v1.0.0
+    spec:
+      containers:
+      - name: worker
+        image: ai-doc-processor:latest
+        imagePullPolicy: Always
+        command: ["celery"]
+        args:
+        - "-A"
+        - "main.celery_app"
+        - "worker"
+        - "--loglevel=info"
+        - "--concurrency=4"
+        - "--max-tasks-per-child=100"
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/0"
+        - name: CELERY_BROKER_URL
+          value: "redis://redis-service:6379/0"
+        - name: LOG_LEVEL
+          value: "INFO"
+        envFrom:
+        - secretRef:
+            name: ai-doc-processor-secrets
+        - configMapRef:
+            name: ai-doc-processor-config
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+            ephemeral-storage: "5Gi"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+            ephemeral-storage: "10Gi"
+        livenessProbe:
+          exec:
+            command:
+            - "celery"
+            - "-A"
+            - "main.celery_app"
+            - "inspect"
+            - "ping"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: temp-storage
+          mountPath: /app/temp
+        - name: logs-storage
+          mountPath: /app/logs
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: temp-storage
+        emptyDir:
+          sizeLimit: "10Gi"
+      - name: logs-storage
+        persistentVolumeClaim:
+          claimName: logs-storage-pvc
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60
+      dnsPolicy: ClusterFirst
+      serviceAccountName: ai-doc-processor-sa
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+    component: cache
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+      component: cache
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: cache
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+          protocol: TCP
+        command:
+        - redis-server
+        - "--appendonly"
+        - "yes"
+        - "--save"
+        - "900 1"
+        - "--save"
+        - "300 10"
+        - "--save"
+        - "60 10000"
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-doc-processor-secrets
+              key: redis-password
+              optional: true
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 999
+          runAsGroup: 999
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-data-pvc
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-doc-processor-config
+  labels:
+    app: ai-doc-processor
+data:
+  # Application Configuration
+  DEBUG: "false"
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  ENVIRONMENT: "production"
+  
+  # File Processing
+  MAX_UPLOAD_SIZE: "50MB"
+  ALLOWED_FILE_TYPES: "pdf,docx,doc,png,jpg,jpeg,tiff"
+  TEMP_STORAGE_PATH: "/app/temp"
+  UPLOAD_STORAGE_PATH: "/app/uploads"
+  
+  # OCR Configuration
+  PADDLEOCR_USE_ANGLE_CLS: "true"
+  PADDLEOCR_LANG: "id,en"
+  TESSERACT_CMD: "/usr/bin/tesseract"
+  
+  # Indonesian Language
+  DEFAULT_LANGUAGE: "id"
+  SUPPORT_MULTILINGUAL: "true"
+  SPACY_MODEL: "xx_ent_wiki_sm"
+  
+  # Rate Limiting
+  RATE_LIMIT_PER_MINUTE: "60"
+  RATE_LIMIT_PER_HOUR: "1000"
+  RATE_LIMIT_PER_DAY: "10000"
+  
+  # Monitoring
+  ENABLE_METRICS: "true"
+  METRICS_PORT: "9090"
+  
+  # CORS
+  CORS_ORIGINS: "https://yourdomain.com,https://app.yourdomain.com"
+  CORS_CREDENTIALS: "true"
+  
+  # Business Configuration
+  BASIC_PLAN_DOCS_LIMIT: "1000"
+  PREMIUM_PLAN_DOCS_LIMIT: "5000"
+  ENTERPRISE_PLAN_DOCS_LIMIT: "-1"
+  
+  # Feature Flags
+  ENABLE_PDF_PROCESSING: "true"
+  ENABLE_DOCX_PROCESSING: "true"
+  ENABLE_IMAGE_OCR: "true"
+  ENABLE_VECTOR_SEARCH: "true"
+  ENABLE_ASYNC_PROCESSING: "true"
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: upload-storage-pvc
+  labels:
+    app: ai-doc-processor
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: fast-ssd
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: logs-storage-pvc
+  labels:
+    app: ai-doc-processor
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data-pvc
+  labels:
+    app: redis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: fast-ssd
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-doc-processor-sa
+  labels:
+    app: ai-doc-processor
+automountServiceAccountToken: false
