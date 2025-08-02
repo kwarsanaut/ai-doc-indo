@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # Main API Service
+  api:
+    build: 
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ai-doc-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./temp:/app/temp
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+      - .:/app  # Mount source for development
+    restart: unless-stopped
+    networks:
+      - ai-doc-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker Service
+  celery-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ai-doc-worker
+    command: celery -A main.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./temp:/app/temp
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+      - .:/app  # Mount source for development
+    restart: unless-stopped
+    networks:
+      - ai-doc-network
+    healthcheck:
+      test: ["CMD", "celery", "-A", "main.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Beat Scheduler (for periodic tasks)
+  celery-beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ai-doc-beat
+    command: celery -A main.celery_app beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - ai-doc-network
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: ai-doc-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+      - ./docker/redis.conf:/usr/local/etc/redis/redis.conf
+    restart: unless-stopped
+    networks:
+      - ai-doc-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database (Optional - for user management)
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai-doc-postgres
+    ports:
+      - "5432:
