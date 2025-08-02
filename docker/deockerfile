@@ -1,0 +1,247 @@
+# Multi-stage build for AI Document Processor
+FROM python:3.11-slim as base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Essential tools
+    curl \
+    wget \
+    git \
+    build-essential \
+    # OCR dependencies
+    tesseract-ocr \
+    tesseract-ocr-ind \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    # Image processing dependencies
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgcc-s1 \
+    # PDF processing dependencies
+    poppler-utils \
+    # Additional utilities
+    ffmpeg \
+    libopencv-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download spaCy model
+RUN python -m spacy download xx_ent_wiki_sm
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p temp uploads logs \
+    && chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Default command
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# ================================
+# Development stage
+# ================================
+FROM base as development
+
+USER root
+
+# Install development dependencies
+RUN apt-get update && apt-get install -y \
+    vim \
+    htop \
+    postgresql-client \
+    redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install development Python packages
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    black \
+    flake8 \
+    mypy \
+    ipython \
+    jupyter
+
+USER appuser
+
+# Development command with auto-reload
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+# ================================
+# Production stage
+# ================================
+FROM base as production
+
+# Additional production optimizations
+USER root
+
+# Remove unnecessary packages to reduce image size
+RUN apt-get update && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install production WSGI server
+RUN pip install --no-cache-dir gunicorn uvicorn[standard]
+
+USER appuser
+
+# Production command with multiple workers
+CMD ["gunicorn", "main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+
+# ================================
+# Worker stage (for Celery workers)
+# ================================
+FROM base as worker
+
+USER appuser
+
+# Worker-specific command
+CMD ["celery", "-A", "main.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+
+# ================================
+# Scheduler stage (for Celery beat)
+# ================================
+FROM base as scheduler
+
+USER appuser
+
+# Scheduler command
+CMD ["celery", "-A", "main.celery_app", "beat", "--loglevel=info"]
+
+# ================================
+# Testing stage
+# ================================
+FROM base as testing
+
+USER root
+
+# Install testing tools
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    pytest-xdist \
+    coverage \
+    factory-boy \
+    faker
+
+USER appuser
+
+# Test command
+CMD ["pytest", "tests/", "-v", "--cov=api", "--cov-report=html"]
+
+# ================================
+# Builder stage for minimal production
+# ================================
+FROM python:3.11-alpine as builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    linux-headers \
+    postgresql-dev \
+    jpeg-dev \
+    zlib-dev \
+    freetype-dev \
+    lcms2-dev \
+    openjpeg-dev \
+    tiff-dev \
+    tk-dev \
+    tcl-dev \
+    harfbuzz-dev \
+    fribidi-dev
+
+# Set work directory
+WORKDIR /app
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install dependencies
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+
+# ================================
+# Final minimal production stage
+# ================================
+FROM python:3.11-alpine as minimal
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    tesseract-ocr \
+    tesseract-ocr-data-ind \
+    tesseract-ocr-data-eng \
+    libpq \
+    jpeg \
+    zlib \
+    freetype \
+    lcms2 \
+    openjpeg \
+    tiff \
+    tk \
+    tcl \
+    curl
+
+# Create user
+RUN addgroup -g 1000 appuser && adduser -D -u 1000 -G appuser appuser
+
+# Set work directory
+WORKDIR /app
+
+# Copy wheels and install
+COPY --from=builder /app/wheels /wheels
+COPY --from=builder /app/requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links /wheels -r requirements.txt \
+    && rm -rf /wheels
+
+# Download spaCy model
+RUN python -m spacy download xx_ent_wiki_sm
+
+# Copy application
+COPY --chown=appuser:appuser . .
+
+# Create directories
+RUN mkdir -p temp uploads logs \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
